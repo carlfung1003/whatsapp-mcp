@@ -66,7 +66,7 @@ func NewMessageStore() (*MessageStore, error) {
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -84,10 +84,29 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS reactions (
+			target_id TEXT NOT NULL,
+			target_chat_jid TEXT NOT NULL,
+			reactor TEXT NOT NULL,
+			emoji TEXT NOT NULL,
+			timestamp TIMESTAMP NOT NULL,
+			PRIMARY KEY (target_id, target_chat_jid, reactor)
+		);
 	`)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Idempotent migration: add quoted_message_id column to messages
+	var hasQuoted int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='quoted_message_id'`).Scan(&hasQuoted)
+	if hasQuoted == 0 {
+		if _, err := db.Exec(`ALTER TABLE messages ADD COLUMN quoted_message_id TEXT`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to add quoted_message_id column: %v", err)
+		}
 	}
 
 	return &MessageStore{db: db}, nil
@@ -109,17 +128,36 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedMessageID string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, quotedMessageID,
+	)
+	return err
+}
+
+// Store or remove a reaction. emoji == "" removes the reactor's reaction.
+func (store *MessageStore) StoreReaction(targetID, targetChatJID, reactor, emoji string, timestamp time.Time) error {
+	if emoji == "" {
+		_, err := store.db.Exec(
+			"DELETE FROM reactions WHERE target_id = ? AND target_chat_jid = ? AND reactor = ?",
+			targetID, targetChatJID, reactor,
+		)
+		return err
+	}
+	_, err := store.db.Exec(
+		`INSERT OR REPLACE INTO reactions
+		(target_id, target_chat_jid, reactor, emoji, timestamp)
+		VALUES (?, ?, ?, ?, ?)`,
+		targetID, targetChatJID, reactor, emoji, timestamp,
 	)
 	return err
 }
@@ -187,6 +225,32 @@ func extractTextContent(msg *waProto.Message) string {
 
 	// For now, we're ignoring non-text messages
 	return ""
+}
+
+// Extract the quoted (reply-to) message ID from any message type that carries ContextInfo.
+// Returns "" if the message is not a reply.
+func extractQuotedMessageID(msg *waProto.Message) string {
+	if msg == nil {
+		return ""
+	}
+	var ctx *waProto.ContextInfo
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		ctx = ext.GetContextInfo()
+	} else if img := msg.GetImageMessage(); img != nil {
+		ctx = img.GetContextInfo()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		ctx = vid.GetContextInfo()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		ctx = doc.GetContextInfo()
+	} else if aud := msg.GetAudioMessage(); aud != nil {
+		ctx = aud.GetContextInfo()
+	} else if stk := msg.GetStickerMessage(); stk != nil {
+		ctx = stk.GetContextInfo()
+	}
+	if ctx == nil {
+		return ""
+	}
+	return ctx.GetStanzaID()
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -371,27 +435,29 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
-// Extract media info from a message
-func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+// Extract media info from a message. msgID is used to make filenames unique —
+// using time.Now() collides badly during history sync where many messages
+// share the same second-resolution timestamp.
+func extractMediaInfo(msg *waProto.Message, msgID string) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
 
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", "image_" + msgID + ".jpg",
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", "video_" + msgID + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", "audio_" + msgID + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -399,7 +465,10 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = "document_" + msgID
+		} else {
+			// Prefix with msg ID so two messages with the same uploaded filename don't collide on disk
+			filename = msgID + "_" + filename
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
@@ -423,16 +492,35 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
+	// Reaction event: store and return — reactions don't go into the messages table.
+	if reaction := msg.Message.GetReactionMessage(); reaction != nil {
+		targetID := reaction.GetKey().GetID()
+		emoji := reaction.GetText()
+		if err := messageStore.StoreReaction(targetID, chatJID, sender, emoji, msg.Info.Timestamp); err != nil {
+			logger.Warnf("Failed to store reaction: %v", err)
+		} else {
+			action := "added"
+			if emoji == "" {
+				action = "removed"
+			}
+			logger.Infof("Reaction %s by %s on %s in %s: %q", action, sender, targetID, chatJID, emoji)
+		}
+		return
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
 	// Extract media info
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message, msg.Info.ID)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
 		return
 	}
+
+	// Extract quoted-message ID (set if this message is a reply)
+	quotedID := extractQuotedMessageID(msg.Message)
 
 	// Store message in database
 	err = messageStore.StoreMessage(
@@ -449,6 +537,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedID,
 	)
 
 	if err != nil {
@@ -871,6 +960,7 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				_ = os.WriteFile("/tmp/whatsapp-qr.txt", []byte(evt.Code), 0600)
 			} else if evt.Event == "success" {
 				connected <- true
 				break
@@ -1053,34 +1143,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
-
-				// Extract media info
-				var mediaType, filename, url string
-				var mediaKey, fileSHA256, fileEncSHA256 []byte
-				var fileLength uint64
-
-				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
-				}
-
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
-
-				// Skip messages with no content and no media
-				if content == "" && mediaType == "" {
-					continue
-				}
-
-				// Determine sender
+				// Determine sender (needed for both messages and reactions)
 				var sender string
 				isFromMe := false
 				if msg.Message.Key != nil {
@@ -1098,18 +1161,63 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					sender = jid.User
 				}
 
-				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
-				}
-
 				// Get message timestamp
 				timestamp := time.Time{}
 				if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
 					timestamp = time.Unix(int64(ts), 0)
 				} else {
 					continue
+				}
+
+				// Reaction event in history: store in reactions table and continue.
+				if msg.Message.Message != nil {
+					if reaction := msg.Message.Message.GetReactionMessage(); reaction != nil {
+						targetID := reaction.GetKey().GetID()
+						emoji := reaction.GetText()
+						if err := messageStore.StoreReaction(targetID, chatJID, sender, emoji, timestamp); err != nil {
+							logger.Warnf("Failed to store history reaction: %v", err)
+						}
+						continue
+					}
+				}
+
+				// Extract text content
+				var content string
+				if msg.Message.Message != nil {
+					if conv := msg.Message.Message.GetConversation(); conv != "" {
+						content = conv
+					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
+						content = ext.GetText()
+					}
+				}
+
+				// Determine the message ID first — needed for unique media filenames
+				msgID := ""
+				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
+					msgID = *msg.Message.Key.ID
+				}
+
+				// Extract media info
+				var mediaType, filename, url string
+				var mediaKey, fileSHA256, fileEncSHA256 []byte
+				var fileLength uint64
+
+				if msg.Message.Message != nil {
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, msgID)
+				}
+
+				// Log the message content for debugging
+				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+
+				// Skip messages with no content and no media
+				if content == "" && mediaType == "" {
+					continue
+				}
+
+				// Extract quoted-message ID if this is a reply
+				var quotedID string
+				if msg.Message.Message != nil {
+					quotedID = extractQuotedMessageID(msg.Message.Message)
 				}
 
 				err = messageStore.StoreMessage(
@@ -1126,6 +1234,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedID,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)

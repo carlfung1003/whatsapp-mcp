@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    list_reactions as whatsapp_list_reactions,
 )
 
 # Initialize FastMCP server
@@ -245,6 +246,25 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def list_reactions(message_id: str, chat_jid: str) -> List[Dict[str, Any]]:
+    """List every reaction on a specific WhatsApp message.
+
+    Args:
+        message_id: The ID of the target message
+        chat_jid: The JID of the chat containing the target message
+    """
+    reactions = whatsapp_list_reactions(message_id, chat_jid)
+    return [
+        {
+            "reactor": r.reactor,
+            "emoji": r.emoji,
+            "timestamp": r.timestamp.isoformat(),
+        }
+        for r in reactions
+    ]
+
 
 if __name__ == "__main__":
     # Initialize and run the server

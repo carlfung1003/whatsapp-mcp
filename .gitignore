@@ -1,3 +1,33 @@
+# --- privacy-critical: never commit any of this ---
+
+# SQLite stores: whatsmeow session + creds + ALL message history
 *.db
-claude_desktop_config.json
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Bridge runtime data: cached encrypted media, decrypted images, the whole
+# session directory. Belt and suspenders against the *.db rules above.
+whatsapp-bridge/store/
+
+# Logs may contain message content + reaction text + JIDs
+*.log
 whatsapp.log
+viewer.log
+
+# QR-pairing artifacts (one-time codes, but still secrets while live)
+/tmp/whatsapp-qr.txt
+
+# Editor/agent config that might embed local paths or keys
+claude_desktop_config.json
+
+# --- build/dev artifacts ---
+
+# Compiled Go binary (platform-specific + redundant)
+whatsapp-bridge/whatsapp-bridge
+
+# Python venv created by uv
+whatsapp-mcp-server/.venv/
+
+# macOS junk
+.DS_Store

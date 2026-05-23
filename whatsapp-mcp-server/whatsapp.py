@@ -11,6 +11,12 @@ MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
+class Reaction:
+    reactor: str
+    emoji: str
+    timestamp: datetime
+
+@dataclass
 class Message:
     timestamp: datetime
     sender: str
@@ -20,6 +26,8 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    quoted_message_id: Optional[str] = None
+    reactions: List[Reaction] = None
 
 @dataclass
 class Chat:
@@ -94,22 +102,64 @@ def get_sender_name(sender_jid: str) -> str:
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
-    
+
     if show_chat_info and message.chat_name:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
-        
+
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-    
+
+    quoted_suffix = ""
+    if getattr(message, 'quoted_message_id', None):
+        quoted_suffix = f" ↪ replying to {message.quoted_message_id}"
+
+    reactions_suffix = ""
+    if getattr(message, 'reactions', None):
+        parts = []
+        for r in message.reactions:
+            try:
+                rname = get_sender_name(r.reactor) or r.reactor
+            except Exception:
+                rname = r.reactor
+            parts.append(f"{r.emoji}({rname})")
+        if parts:
+            reactions_suffix = f" [reactions: {', '.join(parts)}]"
+
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
+        output += f"From: {sender_name}: {content_prefix}{message.content}{quoted_suffix}{reactions_suffix}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
     return output
+
+
+def _fetch_reactions_for_message_ids(cursor, message_ids: List[Tuple[str, str]]) -> dict:
+    """Bulk-fetch reactions for a batch of message ids.
+    Returns dict keyed by target_id → list[Reaction].
+
+    Match on target_id alone (not target_chat_jid). WhatsApp message IDs are
+    globally unique, and the same logical chat can appear under both LID and
+    phone-number JIDs during WhatsApp's ongoing LID rollout — so chat_jid
+    can legitimately diverge between a message and its reaction.
+    """
+    if not message_ids:
+        return {}
+    ids = list({mid for mid, _ in message_ids})
+    placeholders = ",".join("?" for _ in ids)
+    cursor.execute(
+        f"SELECT target_id, reactor, emoji, timestamp FROM reactions "
+        f"WHERE target_id IN ({placeholders})",
+        tuple(ids),
+    )
+    out: dict = {}
+    for tid, reactor, emoji, ts in cursor.fetchall():
+        out.setdefault(tid, []).append(
+            Reaction(reactor=reactor, emoji=emoji, timestamp=datetime.fromisoformat(ts))
+        )
+    return out
 
 def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
     output = ""
@@ -139,7 +189,7 @@ def list_messages(
         cursor = conn.cursor()
         
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
+        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
@@ -197,10 +247,19 @@ def list_messages(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                quoted_message_id=msg[8],
+                reactions=[],
             )
             result.append(message)
-            
+
+        # Attach reactions in bulk for all returned messages.
+        reactions_by_id = _fetch_reactions_for_message_ids(
+            cursor, [(m.id, m.chat_jid) for m in result]
+        )
+        for m in result:
+            m.reactions = reactions_by_id.get(m.id, [])
+
         if include_context and result:
             # Add context for each message
             messages_with_context = []
@@ -235,16 +294,16 @@ def get_message_context(
         
         # Get the target message first
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.quoted_message_id
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
         """, (message_id,))
         msg_data = cursor.fetchone()
-        
+
         if not msg_data:
             raise ValueError(f"Message with ID {message_id} not found")
-            
+
         target_message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
             sender=msg_data[1],
@@ -253,19 +312,21 @@ def get_message_context(
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
             id=msg_data[6],
-            media_type=msg_data[8]
+            media_type=msg_data[8],
+            quoted_message_id=msg_data[9],
+            reactions=[],
         )
-        
+
         # Get messages before
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
             ORDER BY messages.timestamp DESC
             LIMIT ?
         """, (msg_data[7], msg_data[0], before))
-        
+
         before_messages = []
         for msg in cursor.fetchall():
             before_messages.append(Message(
@@ -276,19 +337,21 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                quoted_message_id=msg[8],
+                reactions=[],
             ))
-        
+
         # Get messages after
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
             ORDER BY messages.timestamp ASC
             LIMIT ?
         """, (msg_data[7], msg_data[0], after))
-        
+
         after_messages = []
         for msg in cursor.fetchall():
             after_messages.append(Message(
@@ -299,9 +362,19 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                quoted_message_id=msg[8],
+                reactions=[],
             ))
-        
+
+        # Attach reactions in bulk
+        all_msgs = before_messages + [target_message] + after_messages
+        reactions_by_id = _fetch_reactions_for_message_ids(
+            cursor, [(m.id, m.chat_jid) for m in all_msgs]
+        )
+        for m in all_msgs:
+            m.reactions = reactions_by_id.get(m.id, [])
+
         return MessageContext(
             message=target_message,
             before=before_messages,
@@ -314,6 +387,25 @@ def get_message_context(
     finally:
         if 'conn' in locals():
             conn.close()
+
+
+def list_reactions(message_id: str, chat_jid: str) -> List[Reaction]:
+    """Return all reactions on a single message."""
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT reactor, emoji, timestamp FROM reactions "
+            "WHERE target_id = ? AND target_chat_jid = ? "
+            "ORDER BY timestamp ASC",
+            (message_id, chat_jid),
+        )
+        return [
+            Reaction(reactor=r, emoji=e, timestamp=datetime.fromisoformat(t))
+            for r, e, t in cursor.fetchall()
+        ]
+    finally:
+        conn.close()
 
 
 def list_chats(
