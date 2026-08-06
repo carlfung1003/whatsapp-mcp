@@ -60,6 +60,20 @@ All four are upstreamable — they're self-contained, don't change existing beha
 
   Optional, doesn't affect anything else, leaves the terminal QR in place too.
 
+**Where this earns its keep: recovering from a logged-out bridge.** Stock upstream handles `events.LoggedOut` with a bare `logger.Warnf` and no recovery, and the QR branch is gated on `client.Store.ID == nil` — which is only evaluated at startup. A daemonized bridge that gets unlinked mid-run (you removed the device in WhatsApp → Linked Devices, or WhatsApp force-unlinked it) therefore keeps running forever with a deleted session, silently syncing nothing. `KeepAlive` never fires because the process never exits.
+
+Recovery is to kill it and let the supervisor restart it into the QR branch:
+
+```bash
+rm -f /tmp/whatsapp-qr.txt
+kill $(pgrep -f "whatsapp-bridge/whatsapp-bridge")
+until [ -s /tmp/whatsapp-qr.txt ]; do sleep 1; done
+```
+
+With a headless/daemonized bridge the terminal QR is written to a log file, where half-block Unicode is effectively unscannable — so this patch is what makes unattended recovery possible at all, not just a nicety for awkward terminals. Two traps: the code **rotates every ~20s** (re-render from the file each time; a loop watching its mtime and rewriting the PNG in place keeps an open Preview window permanently current), and there's a **hard 3-minute scan ceiling** after which the process exits and the supervisor starts a fresh cycle. Verify with `SELECT COUNT(*) FROM whatsmeow_device` against `store/whatsapp.db` — `0` means logged out, and that query is the only signal that doesn't lie, since a sessionless bridge still holds a live PID and still serves media downloads from cache.
+
+A worthwhile companion change, not implemented here: have the `events.LoggedOut` case re-open a QR channel (or simply `os.Exit(1)` and let the supervisor handle it) so the bridge self-heals instead of idling.
+
 ## Upstreaming
 
 The patches are commit-ready against upstream `main`. If you want to PR them separately:
