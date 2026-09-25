@@ -223,7 +223,14 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media captions ("Use this weekend" under a photo) are the message text.
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
 	return ""
 }
 
@@ -459,6 +466,12 @@ func extractMediaInfo(msg *waProto.Message, msgID string) (mediaType string, fil
 	if aud := msg.GetAudioMessage(); aud != nil {
 		return "audio", "audio_" + msgID + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
+	}
+
+	// Stickers are .webp images (whatsmeow decrypts them with image keys).
+	if stk := msg.GetStickerMessage(); stk != nil {
+		return "sticker", "sticker_" + msgID + ".webp",
+			stk.GetURL(), stk.GetMediaKey(), stk.GetFileSHA256(), stk.GetFileEncSHA256(), stk.GetFileLength()
 	}
 
 	// Check for document message
@@ -707,7 +720,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Create a downloader that implements DownloadableMessage
 	var waMediaType whatsmeow.MediaType
 	switch mediaType {
-	case "image":
+	case "image", "sticker":
 		waMediaType = whatsmeow.MediaImage
 	case "video":
 		waMediaType = whatsmeow.MediaVideo
